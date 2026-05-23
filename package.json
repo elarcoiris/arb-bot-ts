@@ -1,0 +1,29 @@
+{
+  "name": "arb-bot",
+  "version": "2.0.0",
+  "description": "Coinbase + Kraken + Binance arbitrage bot",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "dry-run": "npm run build && DRY_RUN=true node dist/index.js",
+    "test": "npm run build && node dist/test-connection.js",
+    "dev": "ts-node src/index.ts",
+    "dev:dry": "DRY_RUN=true ts-node src/index.ts"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/node-fetch": "^2.6.11",
+    "@types/ws": "^8.5.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
