@@ -1,18 +1,10 @@
 /**
  * binance.ts - Binance Spot REST + WebSocket client
  *
- * Docs:
- *   REST:      https://developers.binance.com/docs/binance-spot-api-docs/rest-api
- *   WebSocket: https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams
- *
- * Auth: HMAC-SHA256 over query string, appended as &signature=
- * Headers: X-MBX-APIKEY
- *
- * Pair translation:
- *   Coinbase -> Binance
- *   BTC-USD  -> BTCUSDT  (Binance uses USDT, not USD)
- *   ETH-USD  -> ETHUSDT
- *   SOL-USD  -> SOLUSDT
+ * Order type: LIMIT_MAKER
+ *   - Binance's dedicated maker-only order type
+ *   - Rejected immediately if it would fill as a taker (no partial fills)
+ *   - Maker fee: 0.08% (vs 0.10% taker) at lowest volume tier
  *
  * US users: set BINANCE_BASE_URL=https://api.binance.us and
  *           BINANCE_WS_URL=wss://stream.binance.us:9443 in .env
@@ -51,119 +43,79 @@ export class BinanceClient extends EventEmitter implements IExchangeClient {
     super();
     this.apiKey    = apiKey;
     this.apiSecret = apiSecret;
-    // Read overrides after .env has been loaded by the caller
     this.restBase  = process.env['BINANCE_BASE_URL'] ?? DEFAULT_REST_BASE;
     this.wsBase    = process.env['BINANCE_WS_URL']   ?? DEFAULT_WS_BASE;
   }
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
+  // -- Auth ------------------------------------------------------------------
 
   private sign(queryString: string): string {
-    return crypto
-      .createHmac('sha256', this.apiSecret)
-      .update(queryString)
-      .digest('hex');
+    return crypto.createHmac('sha256', this.apiSecret).update(queryString).digest('hex');
   }
 
-  // ── REST helpers ──────────────────────────────────────────────────────────
+  // -- REST helpers ----------------------------------------------------------
 
   private async publicRequest<T>(path: string, params: Record<string, string> = {}): Promise<T> {
     const qs  = new URLSearchParams(params).toString();
     const url = `${this.restBase}${path}${qs ? '?' + qs : ''}`;
     const res = await fetch(url);
     const data = await res.json() as T & { code?: number; msg?: string };
-    if (data.code !== undefined && data.code < 0) {
-      throw new Error(`Binance ${path}: [${data.code}] ${data.msg}`);
-    }
+    if (data.code !== undefined && data.code < 0) throw new Error(`Binance ${path}: [${data.code}] ${data.msg}`);
     return data;
   }
 
-  private async privateRequest<T>(
-    method: string,
-    path: string,
-    params: Record<string, string> = {},
-  ): Promise<T> {
+  private async privateRequest<T>(method: string, path: string, params: Record<string, string> = {}): Promise<T> {
     const allParams = { ...params, timestamp: Date.now().toString() };
     const qs        = new URLSearchParams(allParams).toString();
-    const signature = this.sign(qs);
-    const url       = `${this.restBase}${path}?${qs}&signature=${signature}`;
-
+    const url       = `${this.restBase}${path}?${qs}&signature=${this.sign(qs)}`;
     const res = await fetch(url, {
       method,
-      headers: {
-        'X-MBX-APIKEY': this.apiKey,
-        ...(method !== 'GET' ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
-      },
+      headers: { 'X-MBX-APIKEY': this.apiKey },
     });
     const data = await res.json() as T & { code?: number; msg?: string };
-    if (data.code !== undefined && data.code < 0) {
-      throw new Error(`Binance ${method} ${path}: [${data.code}] ${data.msg}`);
-    }
+    if (data.code !== undefined && data.code < 0) throw new Error(`Binance ${method} ${path}: [${data.code}] ${data.msg}`);
     return data;
   }
 
-  // ── Public price ──────────────────────────────────────────────────────────
+  // -- Public price ----------------------------------------------------------
 
   async getBestBidAsk(pair: string): Promise<PriceSnapshot> {
     const symbol = SYMBOL_MAP[pair];
     if (!symbol) throw new Error(`No Binance symbol mapping for ${pair}`);
-
-    const data = await this.publicRequest<{
-      symbol:   string;
-      bidPrice: string;
-      askPrice: string;
-    }>('/api/v3/ticker/bookTicker', { symbol });
-
-    return {
-      exchange: 'Binance',
-      pair,
-      bid:  parseFloat(data.bidPrice),
-      ask:  parseFloat(data.askPrice),
-      time: new Date(),
-    };
+    const data = await this.publicRequest<{ bidPrice: string; askPrice: string }>(
+      '/api/v3/ticker/bookTicker', { symbol }
+    );
+    return { exchange: 'Binance', pair, bid: parseFloat(data.bidPrice), ask: parseFloat(data.askPrice), time: new Date() };
   }
 
-  // ── Account balance ───────────────────────────────────────────────────────
+  // -- Account balance -------------------------------------------------------
 
   async getBalance(currency: string): Promise<number> {
     const asset = currency === 'USD' ? 'USDT' : currency;
-
-    const data = await this.privateRequest<{
-      balances: Array<{ asset: string; free: string; locked: string }>;
-    }>('GET', '/api/v3/account');
-
+    const data  = await this.privateRequest<{ balances: Array<{ asset: string; free: string }> }>(
+      'GET', '/api/v3/account'
+    );
     const entry = data.balances.find(b => b.asset === asset);
     return entry ? parseFloat(entry.free) : 0;
   }
 
-  // ── Place market order ────────────────────────────────────────────────────
+  // -- Place limit (maker) order ---------------------------------------------
+  //
+  // Uses LIMIT_MAKER order type — Binance's dedicated post-only order.
+  // Automatically rejected if it would cross the book as a taker.
+  // quantity is always in base asset (coins), not quote (USDT).
 
-  async placeMarketOrder(side: OrderSide, pair: string, quantity: number): Promise<OrderResult> {
+  async placeLimitOrder(side: OrderSide, pair: string, quantity: number, limitPrice: number): Promise<OrderResult> {
     const symbol = SYMBOL_MAP[pair];
     if (!symbol) throw new Error(`No Binance symbol mapping for ${pair}`);
-
-    const params: Record<string, string> = {
+    const data = await this.privateRequest<{ orderId: number; status: string }>('POST', '/api/v3/order', {
       symbol,
-      side:  side.toUpperCase(),
-      type:  'MARKET',
-      // Buy with a fixed USDT amount; sell a fixed coin quantity
-      ...(side === 'buy'
-        ? { quoteOrderQty: quantity.toFixed(2) }
-        : { quantity:      quantity.toFixed(8) }),
-    };
-
-    const data = await this.privateRequest<{
-      orderId:       number;
-      clientOrderId: string;
-      status:        string;
-    }>('POST', '/api/v3/order', params);
-
-    return {
-      exchange: 'Binance',
-      orderId:  data.orderId.toString(),
-      side,
-      pair,
-    };
+      side:      side.toUpperCase(),
+      type:      'LIMIT_MAKER',
+      quantity:  quantity.toFixed(8),
+      price:     limitPrice.toFixed(2),
+    });
+    return { exchange: 'Binance', orderId: data.orderId.toString(), side, pair, orderType: 'limit', limitPrice };
   }
 
   async getOrder(orderId: string, pair?: string): Promise<unknown> {
@@ -178,47 +130,27 @@ export class BinanceClient extends EventEmitter implements IExchangeClient {
     return this.privateRequest('DELETE', '/api/v3/order', { symbol, orderId });
   }
 
-  // ── WebSocket for live prices ─────────────────────────────────────────────
+  // -- WebSocket -------------------------------------------------------------
 
   connectWebSocket(pairs: string[]): void {
     const streams = pairs
-      .map(p => SYMBOL_MAP[p])
-      .filter((s): s is string => Boolean(s))
-      .map(sym => `${sym.toLowerCase()}@bookTicker`)
-      .join('/');
-
+      .map(p => SYMBOL_MAP[p]).filter((s): s is string => Boolean(s))
+      .map(sym => `${sym.toLowerCase()}@bookTicker`).join('/');
     const url = `${this.wsBase}/stream?streams=${streams}`;
     this.ws   = new WebSocket(url);
-
     this.ws.on('open', () => this.emit('connected'));
-
     this.ws.on('message', (raw: WebSocket.RawData) => {
       try {
-        const msg = JSON.parse(raw.toString()) as {
-          data?: { s: string; b: string; a: string };
-          s?:    string;
-          b?:    string;
-          a?:    string;
-        };
-
-        const tick = msg.data ?? msg;
-        if (tick.b !== undefined && tick.a !== undefined && tick.s) {
-          const cbPair = REVERSE_MAP[tick.s];
-          if (!cbPair) return;
-
-          const snapshot: PriceSnapshot = {
-            exchange: 'Binance',
-            pair:     cbPair,
-            bid:      parseFloat(tick.b),
-            ask:      parseFloat(tick.a),
-            time:     new Date(),
-          };
-          this.prices[cbPair] = snapshot;
-          this.emit('price', snapshot);
-        }
+        const msg  = JSON.parse(raw.toString()) as { data?: { s: string; b: string; a: string } };
+        const tick = msg.data ?? (msg as unknown as { s: string; b: string; a: string });
+        if (!tick.b || !tick.a || !tick.s) return;
+        const cbPair = REVERSE_MAP[tick.s];
+        if (!cbPair) return;
+        const snapshot: PriceSnapshot = { exchange: 'Binance', pair: cbPair, bid: parseFloat(tick.b), ask: parseFloat(tick.a), time: new Date() };
+        this.prices[cbPair] = snapshot;
+        this.emit('price', snapshot);
       } catch { /* ignore malformed frames */ }
     });
-
     this.ws.on('error', (err: Error) => this.emit('error', err));
     this.ws.on('close', () => {
       this.emit('disconnected');

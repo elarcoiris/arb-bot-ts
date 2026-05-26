@@ -1,25 +1,33 @@
 /**
- * coinbase.ts - Coinbase Advanced Trade REST + WebSocket client
+ * coinbase.ts - Coinbase client
  *
- * Docs: https://docs.cdp.coinbase.com/advanced-trade/reference
+ * Public prices:  Coinbase Exchange public API (no auth required)
+ *                 GET /products/{id}/ticker
  *
- * Auth: HMAC-SHA256 over timestamp + method + path + body
- * Headers: CB-ACCESS-KEY, CB-ACCESS-SIGN, CB-ACCESS-TIMESTAMP
+ * Private orders: Coinbase Advanced Trade API (auth required)
+ *                 POST /api/v3/brokerage/orders
+ *
+ * Order type: limit_limit_gtc (Good-Till-Cancelled limit order)
+ *   - Qualifies as a maker order when placed inside the spread
+ *   - Maker fee: 0.40% (vs 0.60% taker) at lowest volume tier
+ *   - post_only flag ensures the order is rejected rather than crossing
+ *     as a taker if the market moves before placement
+ *
+ * Coinbase Advanced Trade WebSocket requires signed auth on every subscription
+ * so this client polls the public Exchange API instead and emits price events.
  */
 
 import crypto from 'crypto';
 import fetch from 'node-fetch';
 import { EventEmitter } from 'events';
-import WebSocket from 'ws';
 import type { IExchangeClient, OrderResult, OrderSide, PriceSnapshot } from './types';
 
-const REST_BASE = 'https://api.coinbase.com';
-const WS_URL    = 'wss://advanced-trade-ws.coinbase.com';
+const PUBLIC_BASE  = 'https://api.exchange.coinbase.com';
+const PRIVATE_BASE = 'https://api.coinbase.com';
 
 export class CoinbaseClient extends EventEmitter implements IExchangeClient {
   private readonly apiKey:    string;
   private readonly apiSecret: string;
-  private ws: WebSocket | null = null;
   public  readonly prices: Record<string, PriceSnapshot> = {};
 
   constructor(apiKey: string, apiSecret: string) {
@@ -28,14 +36,14 @@ export class CoinbaseClient extends EventEmitter implements IExchangeClient {
     this.apiSecret = apiSecret;
   }
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
+  // -- Auth ------------------------------------------------------------------
 
   private sign(timestamp: string, method: string, path: string, body = ''): string {
     const msg = `${timestamp}${method.toUpperCase()}${path}${body}`;
     return crypto.createHmac('sha256', this.apiSecret).update(msg).digest('hex');
   }
 
-  private headers(method: string, path: string, body = ''): Record<string, string> {
+  private authHeaders(method: string, path: string, body = ''): Record<string, string> {
     const timestamp = Math.floor(Date.now() / 1000).toString();
     return {
       'Content-Type':        'application/json',
@@ -45,150 +53,115 @@ export class CoinbaseClient extends EventEmitter implements IExchangeClient {
     };
   }
 
-  // ── REST helpers ──────────────────────────────────────────────────────────
+  // -- REST helpers ----------------------------------------------------------
 
-  private async request<T>(method: string, path: string, body: unknown = null): Promise<T> {
+  private async publicRequest<T>(path: string): Promise<T> {
+    const res = await fetch(`${PUBLIC_BASE}${path}`, {
+      headers: { 'User-Agent': 'arb-bot/2.0' },
+    });
+    if (!res.ok) throw new Error(`Coinbase public ${path} -> ${res.status}: ${await res.text()}`);
+    return res.json() as Promise<T>;
+  }
+
+  private async privateRequest<T>(method: string, path: string, body: unknown = null): Promise<T> {
     const bodyStr = body ? JSON.stringify(body) : '';
-    const res = await fetch(`${REST_BASE}${path}`, {
+    const res = await fetch(`${PRIVATE_BASE}${path}`, {
       method,
-      headers: this.headers(method, path, bodyStr),
+      headers: this.authHeaders(method, path, bodyStr),
       body:    bodyStr || undefined,
     });
     const data = await res.json() as T;
-    if (!res.ok) {
-      throw new Error(`Coinbase ${method} ${path} -> ${res.status}: ${JSON.stringify(data)}`);
-    }
+    if (!res.ok) throw new Error(`Coinbase ${method} ${path} -> ${res.status}: ${JSON.stringify(data)}`);
     return data;
   }
 
-  // ── Public price ──────────────────────────────────────────────────────────
+  // -- Public price ----------------------------------------------------------
 
   async getBestBidAsk(pair: string): Promise<PriceSnapshot> {
-    const data = await this.request<{
-      pricebooks?: Array<{
-        bids: Array<{ price: string }>;
-        asks: Array<{ price: string }>;
-      }>;
-    }>('GET', `/api/v3/brokerage/best_bid_ask?product_ids=${pair}`);
-
-    const entry = data.pricebooks?.[0];
-    if (!entry) throw new Error(`No price data for ${pair}`);
-
+    const data = await this.publicRequest<{ bid: string; ask: string }>(`/products/${pair}/ticker`);
     return {
       exchange: 'Coinbase',
       pair,
-      bid:  parseFloat(entry.bids[0]?.price ?? '0'),
-      ask:  parseFloat(entry.asks[0]?.price ?? '0'),
+      bid:  parseFloat(data.bid),
+      ask:  parseFloat(data.ask),
       time: new Date(),
     };
   }
 
-  // ── Account balance ───────────────────────────────────────────────────────
+  // -- Account balance -------------------------------------------------------
 
   async getBalance(currency: string): Promise<number> {
-    const data = await this.request<{
-      accounts?: Array<{
-        currency:          string;
-        available_balance: { value: string };
-      }>;
-    }>('GET', '/api/v3/brokerage/accounts');
-
-    const acct = data.accounts?.find(a => a.currency === currency);
+    const data = await this.privateRequest<{ accounts?: Array<{ currency: string; available_balance: { value: string } }> }>(
+      'GET', '/api/v3/brokerage/accounts'
+    );
+    const acct = (data.accounts ?? []).find(a => a.currency === currency);
     return acct ? parseFloat(acct.available_balance.value) : 0;
   }
 
-  // ── Place market order ────────────────────────────────────────────────────
+  // -- Place limit (maker) order ---------------------------------------------
+  //
+  // Uses limit_limit_gtc with post_only=true.
+  // post_only guarantees the order is never filled as a taker — if the market
+  // has moved and the order would cross, Coinbase rejects it rather than
+  // charging the higher taker fee.
+  //
+  // limitPrice for buys:  slightly above current best ask (to sit at top of book)
+  // limitPrice for sells: slightly below current best bid
+  // The engine calculates these via limitOffsetPct before calling this method.
 
-  async placeMarketOrder(side: OrderSide, pair: string, quantity: number): Promise<OrderResult> {
+  async placeLimitOrder(side: OrderSide, pair: string, quantity: number, limitPrice: number): Promise<OrderResult> {
     const clientOrderId = `arb-cb-${Date.now()}`;
     const body = {
       client_order_id: clientOrderId,
       product_id:      pair,
       side:            side.toUpperCase(),
       order_configuration: {
-        market_market_ioc: side === 'buy'
-          ? { quote_size: quantity.toFixed(2) }   // USD amount
-          : { base_size:  quantity.toFixed(8) },  // coin amount
+        limit_limit_gtc: {
+          base_size:   quantity.toFixed(8),
+          limit_price: limitPrice.toFixed(2),
+          post_only:   true,
+        },
       },
     };
 
-    const data = await this.request<{
-      success:        boolean;
-      order_id?:      string;
+    const data = await this.privateRequest<{
+      success:         boolean;
+      order_id?:       string;
       error_response?: unknown;
     }>('POST', '/api/v3/brokerage/orders', body);
 
     if (!data.success || !data.order_id) {
-      throw new Error(`Coinbase order failed: ${JSON.stringify(data.error_response)}`);
+      throw new Error(`Coinbase limit order failed: ${JSON.stringify(data.error_response)}`);
     }
 
-    return { exchange: 'Coinbase', orderId: data.order_id, side, pair };
+    return { exchange: 'Coinbase', orderId: data.order_id, side, pair, orderType: 'limit', limitPrice };
   }
 
   async getOrder(orderId: string): Promise<unknown> {
-    return this.request('GET', `/api/v3/brokerage/orders/historical/${orderId}`);
+    return this.privateRequest('GET', `/api/v3/brokerage/orders/historical/${orderId}`);
   }
 
   async cancelOrder(orderId: string): Promise<unknown> {
-    return this.request('POST', '/api/v3/brokerage/orders/batch_cancel', {
-      order_ids: [orderId],
-    });
+    return this.privateRequest('POST', '/api/v3/brokerage/orders/batch_cancel', { order_ids: [orderId] });
   }
 
-  // ── WebSocket for live prices ─────────────────────────────────────────────
+  // -- Price polling (emulates WebSocket interface) --------------------------
 
   connectWebSocket(pairs: string[]): void {
-    this.ws = new WebSocket(WS_URL);
-
-    this.ws.on('open', () => {
-      const ts = Math.floor(Date.now() / 1000).toString();
-      const subscribeMsg = {
-        type:        'subscribe',
-        product_ids: pairs,
-        channel:     'ticker',
-        api_key:     this.apiKey,
-        timestamp:   ts,
-        signature:   this.sign(ts, 'GET', '/ws/ticker'),
-      };
-      (this.ws as WebSocket).send(JSON.stringify(subscribeMsg));
-      this.emit('connected');
-    });
-
-    this.ws.on('message', (raw: WebSocket.RawData) => {
-      try {
-        const msg = JSON.parse(raw.toString()) as {
-          channel?: string;
-          events?:  Array<{
-            tickers?: Array<{
-              product_id: string;
-              best_bid:   string;
-              best_ask:   string;
-            }>;
-          }>;
-        };
-
-        if (msg.channel === 'ticker' && msg.events) {
-          for (const event of msg.events) {
-            for (const ticker of (event.tickers ?? [])) {
-              const snapshot: PriceSnapshot = {
-                exchange: 'Coinbase',
-                pair:     ticker.product_id,
-                bid:      parseFloat(ticker.best_bid),
-                ask:      parseFloat(ticker.best_ask),
-                time:     new Date(),
-              };
-              this.prices[ticker.product_id] = snapshot;
-              this.emit('price', snapshot);
-            }
-          }
+    const POLL_MS = 2000;
+    const poll = async (): Promise<void> => {
+      for (const pair of pairs) {
+        try {
+          const snapshot = await this.getBestBidAsk(pair);
+          this.prices[pair] = snapshot;
+          this.emit('price', snapshot);
+        } catch (err) {
+          this.emit('error', err as Error);
         }
-      } catch { /* ignore malformed frames */ }
-    });
-
-    this.ws.on('error', (err: Error) => this.emit('error', err));
-    this.ws.on('close', () => {
-      this.emit('disconnected');
-      setTimeout(() => this.connectWebSocket(pairs), 3000);
-    });
+      }
+    };
+    this.emit('connected');
+    void poll();
+    setInterval(() => void poll(), POLL_MS);
   }
 }

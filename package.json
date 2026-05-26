@@ -8,22 +8,54 @@
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
     "dry-run": "npm run build && DRY_RUN=true node dist/index.js",
-    "test": "npm run build && node dist/test-connection.js",
+    "test": "jest",
     "dev": "ts-node src/index.ts",
-    "dev:dry": "DRY_RUN=true ts-node src/index.ts"
+    "dev:dry": "DRY_RUN=true ts-node src/index.ts",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
   },
   "dependencies": {
     "node-fetch": "^2.7.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {
+    "@jest/core": "^29.7.0",
+    "@types/jest": "^29.5.0",
     "@types/node": "^20.11.0",
     "@types/node-fetch": "^2.6.11",
     "@types/ws": "^8.5.10",
-    "ts-node": "^10.9.2",
+    "babel-jest": "^29.7.0",
+    "jest": "^29.7.0",
+    "jest-cli": "^29.7.0",
+    "ts-jest": "^29.4.11",
     "typescript": "^6.0.3"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.ts"
+    ],
+    "transform": {
+      "^.+\\.ts$": [
+        "ts-jest",
+        {
+          "tsconfig": "tsconfig.json"
+        }
+      ]
+    },
+    "verbose": true,
+    "collectCoverageFrom": [
+      "src/**/*.ts",
+      "!src/index.ts",
+      "!src/test-connection.ts"
+    ],
+    "coverageReporters": [
+      "text",
+      "lcov"
+    ]
   }
 }

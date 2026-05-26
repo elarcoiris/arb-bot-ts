@@ -2,17 +2,18 @@
  * types.ts - Shared interfaces and types across the entire bot
  */
 
-// ── Exchange names ────────────────────────────────────────────────────────────
+// -- Exchange names -----------------------------------------------------------
 
 export type ExchangeName = 'Coinbase' | 'Kraken' | 'Binance';
 export type OrderSide    = 'buy' | 'sell';
+export type OrderType    = 'limit' | 'market';
 export type FillStatus   = 'open' | 'filled' | 'cancelled';
 
-// ── Price data ────────────────────────────────────────────────────────────────
+// -- Price data ---------------------------------------------------------------
 
 export interface PriceSnapshot {
   exchange: ExchangeName;
-  pair:     string;       // Coinbase-style, e.g. 'BTC-USD'
+  pair:     string;
   bid:      number;
   ask:      number;
   time:     Date;
@@ -20,16 +21,18 @@ export interface PriceSnapshot {
 
 export type PricesByExchange = Record<ExchangeName, PriceSnapshot>;
 
-// ── Orders ────────────────────────────────────────────────────────────────────
+// -- Orders -------------------------------------------------------------------
 
 export interface OrderResult {
   exchange:  ExchangeName;
   orderId:   string;
   side:      OrderSide;
   pair:      string;
+  orderType: OrderType;
+  limitPrice?: number;
 }
 
-// ── Arbitrage opportunities ───────────────────────────────────────────────────
+// -- Arbitrage opportunities --------------------------------------------------
 
 export interface Opportunity {
   pair:             string;
@@ -43,19 +46,23 @@ export interface Opportunity {
   netProfitUSD:     number;
   coinsBought:      number;
   viable:           boolean;
+  // Limit order prices — set by engine before execution
+  buyLimitPrice?:   number;
+  sellLimitPrice?:  number;
 }
 
-// ── Engine stats ──────────────────────────────────────────────────────────────
+// -- Engine stats -------------------------------------------------------------
 
 export interface EngineStats {
-  scans:           number;
-  opportunities:   number;
-  tradesExecuted:  number;
-  tradesFailed:    number;
-  totalProfitUSD:  number;
+  scans:            number;
+  opportunities:    number;
+  tradesExecuted:   number;
+  tradesFailed:     number;
+  totalProfitUSD:   number;
+  shadowProfitUSD:  number;
 }
 
-// ── Engine events ─────────────────────────────────────────────────────────────
+// -- Engine events ------------------------------------------------------------
 
 export interface TradeCompleteEvent {
   opp:          Opportunity;
@@ -73,24 +80,25 @@ export interface OpportunityGoneEvent {
   reason: string;
 }
 
-// ── Engine constructor options ────────────────────────────────────────────────
+// -- Engine constructor options -----------------------------------------------
 
 export interface EngineOptions {
-  exchanges:      Partial<Record<ExchangeName, IExchangeClient>>;
-  minProfitPct:   number;
-  tradeSizeUSD:   number;
-  dryRun:         boolean;
-  orderTimeoutMs?: number;
+  exchanges:        Partial<Record<ExchangeName, IExchangeClient>>;
+  minProfitPct:     number;
+  tradeSizeUSD:     number;
+  dryRun:           boolean;
+  orderTimeoutMs?:  number;
+  // How far inside the spread to place limit orders as a fraction of price.
+  // e.g. 0.0001 = 0.01% inside. Defaults to 0.0001.
+  limitOffsetPct?:  number;
 }
 
-// ── Exchange client interface ─────────────────────────────────────────────────
-// All three clients implement this contract, ensuring the engine can treat
-// them interchangeably.
+// -- Exchange client interface ------------------------------------------------
 
 export interface IExchangeClient {
   getBestBidAsk(pair: string): Promise<PriceSnapshot>;
   getBalance(currency: string): Promise<number>;
-  placeMarketOrder(side: OrderSide, pair: string, quantity: number): Promise<OrderResult>;
+  placeLimitOrder(side: OrderSide, pair: string, quantity: number, limitPrice: number): Promise<OrderResult>;
   getOrder(orderId: string, pair?: string): Promise<unknown>;
   cancelOrder(orderId: string, pair?: string): Promise<unknown>;
   connectWebSocket(pairs: string[]): void;
@@ -100,19 +108,20 @@ export interface IExchangeClient {
   on(event: 'error',        listener: (err: Error) => void): this;
 }
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// -- Config -------------------------------------------------------------------
 
 export interface BotConfig {
-  cbKey:          string;
-  cbSecret:       string;
-  krakenKey:      string;
-  krakenSecret:   string;
-  binanceKey:     string;
-  binanceSecret:  string;
-  pairs:          string[];
-  minProfitPct:   number;
-  tradeSizeUSD:   number;
-  pollIntervalMs: number;
-  orderTimeoutMs: number;
-  dryRun:         boolean;
+  cbKey:           string;
+  cbSecret:        string;
+  krakenKey:       string;
+  krakenSecret:    string;
+  binanceKey:      string;
+  binanceSecret:   string;
+  pairs:           string[];
+  minProfitPct:    number;
+  tradeSizeUSD:    number;
+  pollIntervalMs:  number;
+  orderTimeoutMs:  number;
+  limitOffsetPct:  number;
+  dryRun:          boolean;
 }

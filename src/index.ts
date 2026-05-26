@@ -13,7 +13,7 @@ import { readFileSync, existsSync } from 'fs';
 import { CoinbaseClient } from './coinbase';
 import { KrakenClient }   from './kraken';
 import { BinanceClient }  from './binance';
-import { ArbitrageEngine, FEES } from './engine';
+import { ArbitrageEngine, MAKER_FEES } from './engine';
 import type {
   BotConfig,
   ExchangeName,
@@ -22,7 +22,7 @@ import type {
   PriceSnapshot,
 } from './types';
 
-// ── Load .env ─────────────────────────────────────────────────────────────────
+// -- Load .env ----------------------------------------------------------------
 
 function loadEnv(): void {
   const envPath = `${__dirname}/../.env`;
@@ -42,7 +42,7 @@ function loadEnv(): void {
 }
 loadEnv();
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// -- Config -------------------------------------------------------------------
 
 const cfg: BotConfig = {
   cbKey:          process.env['COINBASE_API_KEY']    ?? '',
@@ -56,10 +56,11 @@ const cfg: BotConfig = {
   tradeSizeUSD:   parseFloat(process.env['TRADE_SIZE_USD']  ?? '500'),
   pollIntervalMs: parseInt(process.env['POLL_INTERVAL_MS']  ?? '3000'),
   orderTimeoutMs: parseInt(process.env['ORDER_TIMEOUT_SEC'] ?? '10') * 1000,
+  limitOffsetPct:  parseFloat(process.env['LIMIT_OFFSET_PCT'] ?? '0.0001'),
   dryRun:         (process.env['DRY_RUN'] ?? 'true') !== 'false',
 };
 
-// ── Terminal helpers ──────────────────────────────────────────────────────────
+// -- Terminal helpers ---------------------------------------------------------
 
 const C = {
   reset:  '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -67,9 +68,7 @@ const C = {
 } as const;
 
 const LABEL: Record<ExchangeName, string> = {
-  Coinbase: 'CB',
-  Kraken:   'KR',
-  Binance:  'BN',
+  Coinbase: 'CB', Kraken: 'KR', Binance: 'BN',
 };
 
 const ts    = (): string => new Date().toTimeString().slice(0, 8);
@@ -82,7 +81,7 @@ function log(color: string, label: string, msg: string): void {
   console.log(`${C.dim}[${ts()}]${C.reset} ${color}${C.bold}${label}${C.reset} ${msg}`);
 }
 
-// ── Startup banner ────────────────────────────────────────────────────────────
+// -- Startup banner ----------------------------------------------------------
 
 function printBanner(): void {
   console.log();
@@ -96,17 +95,16 @@ function printBanner(): void {
   console.log(`  Pairs:      ${cfg.pairs.join(', ')}`);
   console.log(`  Trade size: ${usd(cfg.tradeSizeUSD)}`);
   console.log(`  Min profit: ${pct(cfg.minProfitPct)} after fees`);
-  console.log(`  Fees:       Binance ${pct(FEES.Binance)} | Kraken ${pct(FEES.Kraken)} | Coinbase ${pct(FEES.Coinbase)}`);
+  console.log(`  Fees:       Binance ${pct(MAKER_FEES.Binance)} | Kraken ${pct(MAKER_FEES.Kraken)} | Coinbase ${pct(MAKER_FEES.Coinbase)} (maker)`);
   console.log(`  Directions: CB<->KR | CB<->BN | KR<->BN  (6 pairs per tick)`);
   console.log();
-
   if (cfg.dryRun) {
     console.log(`${C.yellow}  WARNING: DRY_RUN=true - set DRY_RUN=false in .env to trade live${C.reset}`);
     console.log();
   }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// -- Main --------------------------------------------------------------------
 
 async function main(): Promise<void> {
   printBanner();
@@ -115,21 +113,20 @@ async function main(): Promise<void> {
   const kraken   = new KrakenClient  (cfg.krakenKey,  cfg.krakenSecret);
   const binance  = new BinanceClient (cfg.binanceKey, cfg.binanceSecret);
 
-  const exchanges: Partial<Record<ExchangeName, IExchangeClient>> = {
-    Coinbase: coinbase,
-    Kraken:   kraken,
-    Binance:  binance,
+  const clientMap: Record<ExchangeName, IExchangeClient> = {
+    Coinbase: coinbase, Kraken: kraken, Binance: binance,
   };
 
   const engine = new ArbitrageEngine({
-    exchanges,
+    exchanges:      clientMap,
     minProfitPct:   cfg.minProfitPct,
     tradeSizeUSD:   cfg.tradeSizeUSD,
     dryRun:         cfg.dryRun,
-    orderTimeoutMs: cfg.orderTimeoutMs,
+    orderTimeoutMs:  cfg.orderTimeoutMs,
+    limitOffsetPct:  cfg.limitOffsetPct,
   });
 
-  // ── Engine event handlers ─────────────────────────────────────────────────
+  // -- Engine event handlers -------------------------------------------------
 
   engine.on('opportunity', (opp: Opportunity) => {
     const arrow = `${LABEL[opp.buyExchange]}->${LABEL[opp.sellExchange]}`;
@@ -171,19 +168,40 @@ async function main(): Promise<void> {
     );
   });
 
-  // ── Price state ───────────────────────────────────────────────────────────
-  // Accumulates latest prices from all exchanges; fires engine once all three
-  // have a quote for the same pair.
+  // -- Price state -----------------------------------------------------------
 
   const latestPrices: Record<ExchangeName, Record<string, PriceSnapshot>> = {
-    Coinbase: {},
-    Kraken:   {},
-    Binance:  {},
+    Coinbase: {}, Kraken: {}, Binance: {},
   };
 
+  // Track which exchanges have been seeded per pair to avoid log spam
+  const seeded = new Set<string>(); // `${exchange}:${pair}`
+
   async function onPrice(exchangeName: ExchangeName, snapshot: PriceSnapshot): Promise<void> {
-    latestPrices[exchangeName][snapshot.pair] = snapshot;
     const { pair } = snapshot;
+    const wasNew = !latestPrices[exchangeName][pair];
+    latestPrices[exchangeName][pair] = snapshot;
+
+    // Only log the first time we receive a price from an exchange for a pair
+    if (wasNew) {
+      log(C.cyan, 'PRICE', `${LABEL[exchangeName]} ${pair} live  bid=${snapshot.bid}  ask=${snapshot.ask}`);
+    }
+
+    // For any exchange missing a price for this pair, seed via REST once
+    for (const [name, client] of Object.entries(clientMap) as [ExchangeName, IExchangeClient][]) {
+      const key = `${name}:${pair}`;
+      if (!latestPrices[name][pair] && !seeded.has(key)) {
+        seeded.add(key); // Mark immediately to prevent parallel duplicate requests
+        try {
+          latestPrices[name][pair] = await client.getBestBidAsk(pair);
+          log(C.cyan, 'SEED', `${LABEL[name]} ${pair} seeded via REST`);
+        } catch (err) {
+          seeded.delete(key); // Allow retry on next tick
+          log(C.yellow, 'WARN', `${LABEL[name]} ${pair} seed failed: ${(err as Error).message}`);
+          // Don't return — other exchanges may already be ready
+        }
+      }
+    }
 
     const cb = latestPrices['Coinbase'][pair];
     const kr = latestPrices['Kraken'][pair];
@@ -193,22 +211,44 @@ async function main(): Promise<void> {
     await engine.onPriceUpdate({ Coinbase: cb, Kraken: kr, Binance: bn });
   }
 
-  // ── Decide WebSocket vs. polling based on key availability ───────────────
+  // -- Print a spread summary every 30s so you can see the bot is working ----
 
-  const hasKeys = (key: string) => Boolean(key) && !key.includes('your_');
-  const hasCbKeys = hasKeys(cfg.cbKey);
-  const hasKrKeys = hasKeys(cfg.krakenKey);
-  const hasBnKeys = hasKeys(cfg.binanceKey);
+  setInterval(() => {
+    for (const pair of cfg.pairs) {
+      const cb = latestPrices['Coinbase'][pair];
+      const kr = latestPrices['Kraken'][pair];
+      const bn = latestPrices['Binance'][pair];
+      if (!cb || !kr || !bn) continue;
+
+      const opps  = engine.evaluate({ Coinbase: cb, Kraken: kr, Binance: bn });
+      const best  = opps[0];
+      if (!best) continue;
+
+      const arrow = `${LABEL[best.buyExchange]}->${LABEL[best.sellExchange]}`;
+      const col   = best.viable ? C.green : C.dim;
+      log(col, 'SCAN',
+        `${pair} [${arrow}] gross=${pct(best.grossSpreadPct)} fees=-${pct(best.totalFeesPct)} net=${pct(best.netProfitPct)} ` +
+        `| shadow P&L: ${usd(engine.stats.shadowProfitUSD)} | scans:${engine.stats.scans} opps:${engine.stats.opportunities}`,
+      );
+    }
+  }, 30_000);
+
+  // -- WebSocket vs polling --------------------------------------------------
+
+  const hasKey = (key: string) => Boolean(key) && !key.includes('your_');
+  const hasCbKeys = hasKey(cfg.cbKey);
+  const hasKrKeys = hasKey(cfg.krakenKey);
+  const hasBnKeys = hasKey(cfg.binanceKey);
   const hasAllKeys = hasCbKeys && hasKrKeys && hasBnKeys;
 
   if (hasAllKeys) {
-    log(C.cyan, 'WS', 'Connecting WebSocket feeds to all three exchanges...');
+    log(C.cyan, 'WS', 'Connecting to exchanges...');
 
-    for (const [name, client] of Object.entries(exchanges) as [ExchangeName, IExchangeClient][]) {
+    for (const [name, client] of Object.entries(clientMap) as [ExchangeName, IExchangeClient][]) {
       client.on('price',        (p: PriceSnapshot) => void onPrice(name, p));
-      client.on('connected',    () => log(C.green,  `OK ${LABEL[name]}`, `${name} WebSocket connected`));
-      client.on('disconnected', () => log(C.yellow, `!! ${LABEL[name]}`, `${name} WebSocket disconnected - reconnecting`));
-      client.on('error',        (e: Error) => log(C.red, `ERR ${LABEL[name]}`, `${name} error: ${e.message}`));
+      client.on('connected',    () => log(C.green,  `OK`, `${name} connected`));
+      client.on('disconnected', () => log(C.yellow, `!!`, `${name} disconnected - reconnecting`));
+      client.on('error',        (e: Error) => log(C.red, `ERR`, `${name} error: ${e.message}`));
     }
 
     coinbase.connectWebSocket(cfg.pairs);
@@ -222,7 +262,6 @@ async function main(): Promise<void> {
     ).filter((x): x is string => Boolean(x)).join(', ');
 
     log(C.yellow, 'POLL', `Keys missing for: ${missing}. Polling every ${cfg.pollIntervalMs}ms.`);
-    log(C.yellow, '    ', 'Add API keys to .env to enable WebSocket mode.');
 
     const poll = async (): Promise<void> => {
       for (const pair of cfg.pairs) {
@@ -232,42 +271,19 @@ async function main(): Promise<void> {
             kraken.getBestBidAsk(pair),
             binance.getBestBidAsk(pair),
           ]);
-
           latestPrices['Coinbase'][pair] = cb;
           latestPrices['Kraken'][pair]   = kr;
           latestPrices['Binance'][pair]  = bn;
-
-          const opps = engine.evaluate({ Coinbase: cb, Kraken: kr, Binance: bn });
-          const top  = opps[0];
-          if (top) {
-            const marker = top.viable ? C.green + '^' : C.dim + '-';
-            const arrow  = `${LABEL[top.buyExchange]}->${LABEL[top.sellExchange]}`;
-            process.stdout.write(
-              `${C.dim}[${ts()}]${C.reset} ${marker} ${top.pair} best: ${arrow} net=${pct(top.netProfitPct)}${C.reset}   `,
-            );
-          }
-
           await engine.onPriceUpdate({ Coinbase: cb, Kraken: kr, Binance: bn });
         } catch (err) {
           log(C.red, 'POLL', `${pair}: ${(err as Error).message}`);
         }
       }
-      process.stdout.write('\n');
     };
 
     await poll();
     setInterval(() => void poll(), cfg.pollIntervalMs);
   }
-
-  // ── Stats ticker ──────────────────────────────────────────────────────────
-  setInterval(() => {
-    const s = engine.stats;
-    process.stdout.write(
-      `\r${C.dim}  scans:${s.scans} opps:${s.opportunities} ` +
-      `trades:${s.tradesExecuted} failed:${s.tradesFailed} ` +
-      `P&L: ${s.totalProfitUSD >= 0 ? C.green : C.red}${usd(s.totalProfitUSD)}${C.reset}   `,
-    );
-  }, 10_000);
 }
 
 main().catch((err: unknown) => {
